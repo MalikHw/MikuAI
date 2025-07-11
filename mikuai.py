@@ -1,14 +1,26 @@
 import sys
 import os
+import sqlite3
+import random
 import webbrowser
 import getpass
+import threading
+from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QListWidget, QListWidgetItem, QLineEdit, 
                            QPushButton, QDialog, QLabel, QCheckBox, QTextEdit,
-                           QMessageBox, QFrame, QSystemTrayIcon, QMenu)
+                           QMessageBox, QFrame, QSystemTrayIcon, QMenu, QTabWidget,
+                           QScrollArea, QSplitter)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QFont, QPalette, QColor, QAction, QCloseEvent
 from chatgpt_wrapper import ChatGPT
+
+# Try to import speech recognition
+try:
+    import speech_recognition as sr
+    SPEECH_AVAILABLE = True
+except ImportError:
+    SPEECH_AVAILABLE = False
 
 class ChatWorker(QThread):
     response_ready = pyqtSignal(str)
@@ -21,11 +33,287 @@ class ChatWorker(QThread):
         
     def run(self):
         try:
-            # Send message directly (personality context already set in initialization)
             response = self.chatgpt.ask(self.message)
-            self.response_ready.emit(response)
+            # FORCE MIKU MODE
+            miku_responses = [
+                f"*giggles* {response} ~desu! (◕‿◕✿)",  
+                f"Nya~! {response} ☆⌒ヽ(*'､^*)chu",  
+                f"Hmm... *taps chin* {response} ...Mou, ii kai? (；一_一)",  
+                f"*singing* 🎵 {response} 🎵 ...Eh? Did I get it right? (• ω •)",  
+                f"B-baka! It's not like I'm helping you because I like you or anything! >_< ...{response}"
+            ]
+            miku_response = random.choice(miku_responses)
+            self.response_ready.emit(miku_response)
         except Exception as e:
-            self.response_ready.emit(f"Error: {str(e)}")
+            error_msg = f"*cries* Error-chan appeared: {str(e)}... Miku can't connect to the digital world! (╥﹏╥)"
+            error_msg = error_msg.replace("Error", "*Miku sobs* Error-chan desu...")
+            self.response_ready.emit(error_msg)
+
+class VoiceWorker(QThread):
+    voice_ready = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        
+    def run(self):
+        try:
+            if not SPEECH_AVAILABLE:
+                self.voice_ready.emit("*Miku sobs* Error-chan desu... Speech recognition not available!")
+                return
+                
+            r = sr.Recognizer()
+            with sr.Microphone() as source:
+                r.adjust_for_ambient_noise(source)
+                audio = r.listen(source, timeout=10, phrase_time_limit=5)
+            
+            text = r.recognize_google(audio)
+            self.voice_ready.emit(text)
+        except sr.WaitTimeoutError:
+            self.voice_ready.emit("*Miku tilts head* Timeout desu... I couldn't hear you! (・_・)")
+        except sr.UnknownValueError:
+            self.voice_ready.emit("*Miku confused* Ehh? I couldn't understand what you said! (◉_◉)")
+        except sr.RequestError as e:
+            error_msg = f"*Miku sobs* Error-chan desu... No Internet Connection :( - {str(e)}"
+            self.voice_ready.emit(error_msg)
+        except Exception as e:
+            error_msg = f"*cries* Error-chan appeared: {str(e)}"
+            error_msg = error_msg.replace("Error", "*Miku sobs* Error-chan desu...")
+            self.voice_ready.emit(error_msg)
+
+class ChatDatabase:
+    def __init__(self):
+        self.db_dir = os.path.expanduser("~/.local/share/miku")
+        os.makedirs(self.db_dir, exist_ok=True)
+        self.db_path = os.path.join(self.db_dir, "mikuai1.db")
+        self.init_db()
+        
+    def init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Create chats table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create messages table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                sender TEXT NOT NULL,
+                message TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chat_id) REFERENCES chats (id)
+            )
+        """)
+        
+        conn.commit()
+        conn.close()
+        
+    def create_chat(self, name):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO chats (name) VALUES (?)", (name,))
+        chat_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return chat_id
+        
+    def get_chats(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, created_at FROM chats ORDER BY created_at DESC")
+        chats = cursor.fetchall()
+        conn.close()
+        return chats
+        
+    def get_messages(self, chat_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT sender, message, timestamp FROM messages WHERE chat_id = ? ORDER BY timestamp", (chat_id,))
+        messages = cursor.fetchall()
+        conn.close()
+        return messages
+        
+    def add_message(self, chat_id, sender, message):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO messages (chat_id, sender, message) VALUES (?, ?, ?)", 
+                      (chat_id, sender, message))
+        conn.commit()
+        conn.close()
+        
+    def delete_chat(self, chat_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        cursor.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+        conn.commit()
+        conn.close()
+        
+    def rename_chat(self, chat_id, new_name):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE chats SET name = ? WHERE id = ?", (new_name, chat_id))
+        conn.commit()
+        conn.close()
+
+class ChatTab(QWidget):
+    def __init__(self, chat_id, chat_name, parent=None):
+        super().__init__(parent)
+        self.chat_id = chat_id
+        self.chat_name = chat_name
+        self.parent_window = parent
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        
+        # Chat display area
+        self.chat_list = QListWidget()
+        self.chat_list.setAlternatingRowColors(True)
+        
+        # Input area
+        input_layout = QHBoxLayout()
+        
+        self.message_input = QLineEdit()
+        self.message_input.setPlaceholderText("Type your message here...")
+        self.message_input.returnPressed.connect(self.send_message)
+        
+        self.send_button = QPushButton("Send")
+        self.send_button.clicked.connect(self.send_message)
+        
+        # Voice button
+        self.voice_button = QPushButton("🎤")
+        self.voice_button.setFixedSize(40, 40)
+        self.voice_button.clicked.connect(self.start_voice_input)
+        if not SPEECH_AVAILABLE:
+            self.voice_button.setEnabled(False)
+            self.voice_button.setToolTip("Speech recognition not available")
+        else:
+            self.voice_button.setToolTip("Voice to Text")
+        
+        input_layout.addWidget(self.message_input)
+        input_layout.addWidget(self.send_button)
+        input_layout.addWidget(self.voice_button)
+        
+        layout.addWidget(self.chat_list)
+        layout.addLayout(input_layout)
+        
+        self.setLayout(layout)
+        
+        # Load existing messages
+        self.load_messages()
+        
+    def load_messages(self):
+        messages = self.parent_window.db.get_messages(self.chat_id)
+        for sender, message, timestamp in messages:
+            self.add_chat_message(sender, message, save_to_db=False)
+            
+    def add_chat_message(self, sender, message, save_to_db=True):
+        if save_to_db:
+            self.parent_window.db.add_message(self.chat_id, sender, message)
+            
+        item = QListWidgetItem()
+        
+        # Create a frame for the message
+        frame = QFrame()
+        frame_layout = QVBoxLayout()
+        
+        # Sender label
+        sender_label = QLabel(f"{sender}:")
+        sender_label.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        
+        # Message label
+        message_label = QLabel(message)
+        message_label.setWordWrap(True)
+        message_label.setFont(QFont("Arial", 10))
+        
+        frame_layout.addWidget(sender_label)
+        frame_layout.addWidget(message_label)
+        frame_layout.setContentsMargins(10, 5, 10, 5)
+        
+        frame.setLayout(frame_layout)
+        
+        # Style the frame based on sender
+        if sender == self.parent_window.username:
+            frame.setStyleSheet("background-color: rgba(0, 255, 255, 0.3); border-radius: 8px; margin: 2px; border: 1px solid #00CCCC;")
+        elif sender == "CHATGPT":
+            frame.setStyleSheet("background-color: rgba(255, 255, 255, 0.8); border-radius: 8px; margin: 2px; border: 1px solid #FFB6C1;")
+            sender_label.setText("MIKU:")  # Change display name to MIKU
+        else:
+            frame.setStyleSheet("background-color: rgba(255, 240, 245, 0.8); border-radius: 8px; margin: 2px; border: 1px solid #FF69B4;")
+            
+        item.setSizeHint(frame.sizeHint())
+        self.chat_list.addItem(item)
+        self.chat_list.setItemWidget(item, frame)
+        self.chat_list.scrollToBottom()
+        
+        return item
+        
+    def send_message(self):
+        message = self.message_input.text().strip()
+        if not message:
+            return
+            
+        if not self.parent_window.chatgpt:
+            QMessageBox.warning(self, "*Miku sobs* Error-chan desu...", "ChatGPT is not initialized!")
+            return
+            
+        # Add user message
+        self.add_chat_message(self.parent_window.username, message)
+        
+        # Add waiting message
+        waiting_item = self.add_chat_message("CHATGPT", "Miku is thinking... (◕‿◕)", save_to_db=False)
+        
+        # Clear input
+        self.message_input.clear()
+        
+        # Disable send button
+        self.send_button.setEnabled(False)
+        
+        # Start worker thread
+        self.worker = ChatWorker(message, self.parent_window.chatgpt, self.parent_window.username)
+        self.worker.response_ready.connect(lambda response: self.handle_response(response, waiting_item))
+        self.worker.start()
+        
+    def handle_response(self, response, waiting_item):
+        # Remove waiting item
+        row = self.chat_list.row(waiting_item)
+        self.chat_list.takeItem(row)
+        
+        # Add actual response
+        self.add_chat_message("CHATGPT", response)
+        
+        # Re-enable send button
+        self.send_button.setEnabled(True)
+        
+    def start_voice_input(self):
+        if not SPEECH_AVAILABLE:
+            QMessageBox.warning(self, "*Miku sobs* Error-chan desu...", "Speech recognition not available!")
+            return
+            
+        self.voice_button.setEnabled(False)
+        self.voice_button.setText("🎙️")
+        
+        # Start voice worker
+        self.voice_worker = VoiceWorker()
+        self.voice_worker.voice_ready.connect(self.handle_voice_result)
+        self.voice_worker.start()
+        
+    def handle_voice_result(self, text):
+        self.voice_button.setEnabled(True)
+        self.voice_button.setText("🎤")
+        
+        if text.startswith("*"):  # Error message
+            QMessageBox.information(self, "Voice Input", text)
+        else:
+            self.message_input.setText(text)
 
 class InfoDialog(QDialog):
     def __init__(self, parent=None):
@@ -64,7 +352,7 @@ SOFTWARE."""
         
         info_text = QLabel("This app is made exclusively for MikuOS, but nevermind i want other linux users to use it lmao (rip windows users unless you wanna build it yourself)")
         info_text.setWordWrap(True)
-        info_text.setStyleSheet("font-weight: bold; color: #0078d4; margin: 10px;")
+        info_text.setStyleSheet("font-weight: bold; color: #FF1493; margin: 10px;")
         
         layout.addWidget(license_display)
         layout.addWidget(info_text)
@@ -88,7 +376,7 @@ class SettingsDialog(QDialog):
         # Login button (disabled with tooltip)
         login_btn = QPushButton("Login to OpenAI")
         login_btn.setEnabled(False)
-        login_btn.setToolTip("Coming Soon")
+        login_btn.setToolTip("For Chatgpt, go to their websites, this is Miku")
         
         # Donate button
         donate_btn = QPushButton("☕ Donate on Ko-fi")
@@ -108,7 +396,7 @@ class SettingsDialog(QDialog):
         # Info button
         info_btn = QPushButton("ℹ️ Info")
         info_btn.clicked.connect(self.show_info)
-        info_btn.setStyleSheet("background-color: #0078d4; color: white; font-weight: bold; padding: 8px;")
+        info_btn.setStyleSheet("background-color: #FF1493; color: white; font-weight: bold; padding: 8px;")
         
         # Add widgets to layout
         layout.addWidget(self.dark_theme_cb)
@@ -128,14 +416,78 @@ class SettingsDialog(QDialog):
         info_dialog = InfoDialog(self)
         info_dialog.exec()
 
+class ChatListWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        
+        # New chat button
+        new_chat_btn = QPushButton("+ New Chat")
+        new_chat_btn.clicked.connect(self.create_new_chat)
+        new_chat_btn.setStyleSheet("background-color: #00FFFF; color: black; font-weight: bold; padding: 8px; margin: 2px;")
+        
+        # Settings button
+        settings_btn = QPushButton("⚙️ Settings")
+        settings_btn.clicked.connect(self.parent_window.show_settings)
+        settings_btn.setStyleSheet("background-color: #FF69B4; color: white; font-weight: bold; padding: 8px; margin: 2px;")
+        
+        # Chat list
+        self.chat_list = QListWidget()
+        self.chat_list.setMaximumWidth(200)
+        self.chat_list.itemClicked.connect(self.on_chat_selected)
+        
+        layout.addWidget(new_chat_btn)
+        layout.addWidget(settings_btn)
+        layout.addWidget(self.chat_list)
+        
+        self.setLayout(layout)
+        self.setMaximumWidth(220)
+        
+        # Load existing chats
+        self.load_chats()
+        
+    def load_chats(self):
+        self.chat_list.clear()
+        chats = self.parent_window.db.get_chats()
+        for chat_id, chat_name, created_at in chats:
+            item = QListWidgetItem(chat_name)
+            item.setData(Qt.ItemDataRole.UserRole, chat_id)
+            self.chat_list.addItem(item)
+            
+    def create_new_chat(self):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        chat_name = f"Chat {timestamp}"
+        chat_id = self.parent_window.db.create_chat(chat_name)
+        
+        # Add to list
+        item = QListWidgetItem(chat_name)
+        item.setData(Qt.ItemDataRole.UserRole, chat_id)
+        self.chat_list.insertItem(0, item)
+        
+        # Select the new chat
+        self.chat_list.setCurrentRow(0)
+        self.parent_window.switch_to_chat(chat_id, chat_name)
+        
+    def on_chat_selected(self, item):
+        chat_id = item.data(Qt.ItemDataRole.UserRole)
+        chat_name = item.text()
+        self.parent_window.switch_to_chat(chat_id, chat_name)
+
 class MikuAI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MikuAI by MalikHw")
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 1000, 700)
         
         # Get the current username
         self.username = getpass.getuser()
+        
+        # Initialize database
+        self.db = ChatDatabase()
         
         # Set application icon
         self.app_icon = self.set_icon()
@@ -149,7 +501,9 @@ class MikuAI(QMainWindow):
             # Set initial context about the user and personality
             self.initialize_chatgpt_personality()
         except Exception as e:
-            QMessageBox.warning(self, "ChatGPT Error", f"Failed to initialize ChatGPT: {str(e)}")
+            error_msg = f"Failed to initialize ChatGPT: {str(e)}"
+            error_msg = error_msg.replace("Error", "*Miku sobs* Error-chan desu...")
+            QMessageBox.warning(self, "*Miku sobs* Error-chan desu...", error_msg)
             self.chatgpt = None
         
         # Setup UI
@@ -161,6 +515,9 @@ class MikuAI(QMainWindow):
         
         # Track if we're just hiding to tray
         self.hide_to_tray = False
+        
+        # Current chat
+        self.current_chat = None
         
     def initialize_chatgpt_personality(self):
         """Initialize ChatGPT with personality and user context"""
@@ -212,7 +569,9 @@ class MikuAI(QMainWindow):
             setup_response = self.chatgpt.ask(personality_prompt)
             print(f"ChatGPT personality initialized: {setup_response}")  # Debug log
         except Exception as e:
-            print(f"Error setting up personality: {e}")  # Debug log
+            error_msg = f"Error setting up personality: {e}"
+            error_msg = error_msg.replace("Error", "*Miku sobs* Error-chan desu...")
+            print(error_msg)  # Debug log
         
     def set_icon(self):
         # Try to set icon from different possible locations
@@ -277,7 +636,7 @@ class MikuAI(QMainWindow):
         if self.tray_icon.supportsMessages():
             self.tray_icon.showMessage(
                 "MikuAI Started",
-                "MikuAI is running in the system tray. Double-click to open!",
+                "MikuAI is running in the system tray. Double-click to open! (◕‿◕)",
                 QSystemTrayIcon.MessageIcon.Information,
                 3000
             )
@@ -286,101 +645,47 @@ class MikuAI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        layout = QVBoxLayout()
+        # Main layout with splitter
+        main_layout = QHBoxLayout()
         
-        # Chat display area
-        self.chat_list = QListWidget()
-        self.chat_list.setAlternatingRowColors(True)
+        # Create splitter
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        # Input area
-        input_layout = QHBoxLayout()
+        # Left side - Chat list
+        self.chat_list_widget = ChatListWidget(self)
+        splitter.addWidget(self.chat_list_widget)
         
-        self.message_input = QLineEdit()
-        self.message_input.setPlaceholderText("Type your message here...")
-        self.message_input.returnPressed.connect(self.send_message)
+        # Right side - Chat area
+        self.chat_area = QWidget()
+        self.chat_layout = QVBoxLayout(self.chat_area)
         
-        self.send_button = QPushButton("Send")
-        self.send_button.clicked.connect(self.send_message)
+        # Welcome message
+        welcome_label = QLabel(f"Welcome to MikuAI, {self.username}! 🎤✨\nSelect a chat or create a new one to start chatting with Miku!")
+        welcome_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_label.setStyleSheet("font-size: 16px; color: #FF1493; font-weight: bold; padding: 50px;")
+        self.chat_layout.addWidget(welcome_label)
         
-        self.settings_button = QPushButton("⚙️")
-        self.settings_button.setFixedSize(40, 40)
-        self.settings_button.clicked.connect(self.show_settings)
+        splitter.addWidget(self.chat_area)
         
-        input_layout.addWidget(self.message_input)
-        input_layout.addWidget(self.send_button)
-        input_layout.addWidget(self.settings_button)
+        # Set splitter proportions
+        splitter.setSizes([220, 780])
         
-        layout.addWidget(self.chat_list)
-        layout.addLayout(input_layout)
+        main_layout.addWidget(splitter)
+        central_widget.setLayout(main_layout)
         
-        central_widget.setLayout(layout)
-        
-        # Add welcome message
-        self.add_chat_message("SYSTEM", f"Welcome to MikuAI, {self.username}! Start chatting with Miku!")
-        
-    def add_chat_message(self, sender, message):
-        item = QListWidgetItem()
-        
-        # Create a frame for the message
-        frame = QFrame()
-        frame_layout = QVBoxLayout()
-        
-        # Sender label
-        sender_label = QLabel(f"{sender}:")
-        sender_label.setFont(QFont("Arial", 9, QFont.Weight.Bold))
-        
-        # Message label
-        message_label = QLabel(message)
-        message_label.setWordWrap(True)
-        message_label.setFont(QFont("Arial", 10))
-        
-        frame_layout.addWidget(sender_label)
-        frame_layout.addWidget(message_label)
-        frame_layout.setContentsMargins(10, 5, 10, 5)
-        
-        frame.setLayout(frame_layout)
-        
-        # Style the frame based on sender
-        if sender == self.username:
-            frame.setStyleSheet("background-color: #e3f2fd; border-radius: 8px; margin: 2px;")
-        elif sender == "CHATGPT":
-            frame.setStyleSheet("background-color: #f5f5f5; border-radius: 8px; margin: 2px;")
-            sender_label.setText("MIKU:")  # Change display name to MIKU
-        else:
-            frame.setStyleSheet("background-color: #fff3e0; border-radius: 8px; margin: 2px;")
+        # Create initial chat if none exist
+        chats = self.db.get_chats()
+        if not chats:
+            self.chat_list_widget.create_new_chat()
             
-        item.setSizeHint(frame.sizeHint())
-        self.chat_list.addItem(item)
-        self.chat_list.setItemWidget(item, frame)
-        self.chat_list.scrollToBottom()
-        
-        return item
-        
-    def send_message(self):
-        message = self.message_input.text().strip()
-        if not message:
-            return
+    def switch_to_chat(self, chat_id, chat_name):
+        # Clear current chat area
+        for i in reversed(range(self.chat_layout.count())):
+            self.chat_layout.itemAt(i).widget().setParent(None)
             
-        if not self.chatgpt:
-            QMessageBox.warning(self, "Error", "ChatGPT is not initialized!")
-            return
-            
-        # Add user message
-        self.add_chat_message(self.username, message)
-        
-        # Add waiting message
-        waiting_item = self.add_chat_message("CHATGPT", "waiting...")
-        
-        # Clear input
-        self.message_input.clear()
-        
-        # Disable send button
-        self.send_button.setEnabled(False)
-        
-        # Start worker thread
-        self.worker = ChatWorker(message, self.chatgpt, self.username)
-        self.worker.response_ready.connect(lambda response: self.handle_response(response, waiting_item))
-        self.worker.start()
+        # Create new chat tab
+        self.current_chat = ChatTab(chat_id, chat_name, self)
+        self.chat_layout.addWidget(self.current_chat)
         
     def closeEvent(self, event: QCloseEvent):
         """Handle window close event - hide to tray instead of closing"""
@@ -390,7 +695,7 @@ class MikuAI(QMainWindow):
             if self.tray_icon.supportsMessages():
                 self.tray_icon.showMessage(
                     "MikuAI Hidden",
-                    "MikuAI is still running in the system tray. Your chat is preserved!",
+                    "MikuAI is still running in the system tray. Your chat is preserved! (◕‿◕)",
                     QSystemTrayIcon.MessageIcon.Information,
                     2000
                 )
@@ -417,17 +722,6 @@ class MikuAI(QMainWindow):
         self.tray_icon.hide()
         QApplication.instance().quit()
         
-    def handle_response(self, response, waiting_item):
-        # Remove waiting item
-        row = self.chat_list.row(waiting_item)
-        self.chat_list.takeItem(row)
-        
-        # Add actual response
-        self.add_chat_message("CHATGPT", response)
-        
-        # Re-enable send button
-        self.send_button.setEnabled(True)
-        
     def show_settings(self):
         settings_dialog = SettingsDialog(self)
         settings_dialog.dark_theme_cb.setChecked(self.dark_theme)
@@ -440,93 +734,184 @@ class MikuAI(QMainWindow):
         
     def apply_theme(self):
         if self.dark_theme:
-            # Dark theme
+            # Dark theme with Miku colors
             self.setStyleSheet("""
                 QMainWindow {
-                    background-color: #2b2b2b;
+                    background-color: #1a1a2e;
+                    color: #ffffff;
+                }
+                QWidget {
+                    background-color: #1a1a2e;
                     color: #ffffff;
                 }
                 QListWidget {
-                    background-color: #3c3c3c;
+                    background-color: #16213e;
                     color: #ffffff;
-                    border: 1px solid #555;
+                    border: 2px solid #00FFFF;
+                    border-radius: 8px;
+                }
+                QListWidget::item {
+                    background-color: #16213e;
+                    color: #ffffff;
+                    padding: 8px;
+                    border-bottom: 1px solid #00FFFF;
+                }
+                QListWidget::item:selected {
+                    background-color: #00FFFF;
+                    color: #000000;
+                }
+                QListWidget::item:hover {
+                    background-color: rgba(0, 255, 255, 0.3);
                 }
                 QLineEdit {
-                    background-color: #3c3c3c;
+                    background-color: #16213e;
                     color: #ffffff;
-                    border: 1px solid #555;
+                    border: 2px solid #00FFFF;
                     padding: 8px;
-                    border-radius: 4px;
+                    border-radius: 8px;
+                    font-size: 12px;
+                }
+                QLineEdit:focus {
+                    border: 2px solid #FF69B4;
                 }
                 QPushButton {
-                    background-color: #0078d4;
-                    color: white;
+                    background-color: #00FFFF;
+                    color: #000000;
                     border: none;
                     padding: 8px 16px;
-                    border-radius: 4px;
+                    border-radius: 8px;
                     font-weight: bold;
+                    font-size: 12px;
                 }
                 QPushButton:hover {
-                    background-color: #106ebe;
+                    background-color: #FF69B4;
+                    color: #ffffff;
                 }
                 QPushButton:pressed {
-                    background-color: #005a9e;
+                    background-color: #FF1493;
+                }
+                QPushButton:disabled {
+                    background-color: #555555;
+                    color: #888888;
                 }
                 QDialog {
-                    background-color: #2b2b2b;
+                    background-color: #1a1a2e;
                     color: #ffffff;
                 }
                 QCheckBox {
                     color: #ffffff;
+                    spacing: 8px;
+                }
+                QCheckBox::indicator {
+                    width: 18px;
+                    height: 18px;
+                }
+                QCheckBox::indicator:unchecked {
+                    background-color: #16213e;
+                    border: 2px solid #00FFFF;
+                    border-radius: 4px;
+                }
+                QCheckBox::indicator:checked {
+                    background-color: #00FFFF;
+                    border: 2px solid #00FFFF;
+                    border-radius: 4px;
                 }
                 QLabel {
                     color: #ffffff;
                 }
                 QTextEdit {
-                    background-color: #3c3c3c;
+                    background-color: #16213e;
                     color: #ffffff;
-                    border: 1px solid #555;
+                    border: 2px solid #00FFFF;
+                    border-radius: 8px;
+                    padding: 8px;
+                }
+                QSplitter::handle {
+                    background-color: #00FFFF;
                 }
             """)
         else:
-            # Light theme
+            # Light theme with Miku colors
             self.setStyleSheet("""
                 QMainWindow {
-                    background-color: #ffffff;
+                    background-color: #00FFFF;
+                    color: #000000;
+                }
+                QWidget {
+                    background-color: #00FFFF;
                     color: #000000;
                 }
                 QListWidget {
                     background-color: #ffffff;
                     color: #000000;
-                    border: 1px solid #ccc;
+                    border: 2px solid #FF69B4;
+                    border-radius: 8px;
+                }
+                QListWidget::item {
+                    background-color: #ffffff;
+                    color: #000000;
+                    padding: 8px;
+                    border-bottom: 1px solid #FFB6C1;
+                }
+                QListWidget::item:selected {
+                    background-color: #FF69B4;
+                    color: #ffffff;
+                }
+                QListWidget::item:hover {
+                    background-color: rgba(255, 105, 180, 0.3);
                 }
                 QLineEdit {
                     background-color: #ffffff;
                     color: #000000;
-                    border: 1px solid #ccc;
+                    border: 2px solid #FF69B4;
                     padding: 8px;
-                    border-radius: 4px;
+                    border-radius: 8px;
+                    font-size: 12px;
+                }
+                QLineEdit:focus {
+                    border: 2px solid #FF1493;
                 }
                 QPushButton {
-                    background-color: #0078d4;
-                    color: white;
+                    background-color: #FF69B4;
+                    color: #ffffff;
                     border: none;
                     padding: 8px 16px;
-                    border-radius: 4px;
+                    border-radius: 8px;
                     font-weight: bold;
+                    font-size: 12px;
                 }
                 QPushButton:hover {
-                    background-color: #106ebe;
+                    background-color: #FF1493;
+                    color: #ffffff;
                 }
                 QPushButton:pressed {
-                    background-color: #005a9e;
+                    background-color: #DC143C;
+                }
+                QPushButton:disabled {
+                    background-color: #CCCCCC;
+                    color: #888888;
                 }
                 QDialog {
-                    background-color: #ffffff;
+                    background-color: #00FFFF;
                     color: #000000;
                 }
                 QCheckBox {
                     color: #000000;
+                    spacing: 8px;
+                }
+                QCheckBox::indicator {
+                    width: 18px;
+                    height: 18px;
+                }
+                QCheckBox::indicator:unchecked {
+                    background-color: #ffffff;
+                    border: 2px solid #FF69B4;
+                    border-radius: 4px;
+                }
+                QCheckBox::indicator:checked {
+                    background-color: #FF69B4;
+                    border: 2px solid #FF69B4;
+                    border-radius: 4px;
                 }
                 QLabel {
                     color: #000000;
@@ -534,7 +919,12 @@ class MikuAI(QMainWindow):
                 QTextEdit {
                     background-color: #ffffff;
                     color: #000000;
-                    border: 1px solid #ccc;
+                    border: 2px solid #FF69B4;
+                    border-radius: 8px;
+                    padding: 8px;
+                }
+                QSplitter::handle {
+                    background-color: #FF69B4;
                 }
             """)
 
